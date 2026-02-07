@@ -27,9 +27,11 @@ const detectPlatform = (url) => {
 // Check if yt-dlp is available
 const checkYtDlp = async () => {
   try {
-    await execAsync('yt-dlp --version');
+    const { stdout } = await execAsync('yt-dlp --version');
+    console.log('✅ yt-dlp version:', stdout.trim());
     return true;
   } catch (error) {
+    console.error('❌ yt-dlp not found:', error.message);
     return false;
   }
 };
@@ -43,23 +45,30 @@ router.post('/info', async (req, res) => {
       return res.status(400).json({ message: 'URL is required' });
     }
 
+    console.log('📥 Getting info for URL:', url);
+
     const hasYtDlp = await checkYtDlp();
     if (!hasYtDlp) {
       return res.status(500).json({ 
-        message: 'yt-dlp is not installed. Please install it to use this service.',
-        installInstructions: 'Install yt-dlp: pip install yt-dlp or brew install yt-dlp'
+        message: 'yt-dlp is not installed on the server.',
+        details: 'Please contact the administrator to install yt-dlp.'
       });
     }
 
     const platform = detectPlatform(url);
     
     // Get video information using yt-dlp
-    const { stdout } = await execAsync(`yt-dlp --dump-json --no-playlist "${url}"`);
+    console.log('🔍 Fetching video info...');
+    const { stdout } = await execAsync(`yt-dlp --dump-json --no-playlist "${url}"`, {
+      timeout: 30000 // 30 second timeout
+    });
+    
     const videoInfo = JSON.parse(stdout);
+    console.log('✅ Video info fetched:', videoInfo.title);
     
     const response = {
       title: videoInfo.title || 'Untitled',
-      thumbnail: videoInfo.thumbnail || videoInfo.thumbnails?.[0] || '',
+      thumbnail: videoInfo.thumbnail || videoInfo.thumbnails?.[0]?.url || '',
       duration: videoInfo.duration || 0,
       platform: platform,
       availableQualities: []
@@ -109,10 +118,11 @@ router.post('/info', async (req, res) => {
 
     res.json(response);
   } catch (error) {
-    console.error('Error getting video info:', error);
+    console.error('❌ Error getting video info:', error);
     res.status(500).json({ 
       message: 'Failed to get video information',
-      error: error.message 
+      error: error.message,
+      details: 'Make sure the URL is valid and accessible.'
     });
   }
 });
@@ -126,17 +136,19 @@ router.post('/video', async (req, res) => {
       return res.status(400).json({ message: 'URL is required' });
     }
 
+    console.log('📥 Download request:', { url, quality, format });
+
     const hasYtDlp = await checkYtDlp();
     if (!hasYtDlp) {
       return res.status(500).json({ 
-        message: 'yt-dlp is not installed. Please install it first.' 
+        message: 'yt-dlp is not installed on the server.' 
       });
     }
 
-    const platform = detectPlatform(url);
-    const outputPath = path.join(__dirname, '../downloads');
+    // ✅ Use /tmp directory (writable on Render)
+    const outputPath = '/tmp';
     
-    // Create downloads directory if it doesn't exist
+    // Create /tmp directory if it doesn't exist (should exist by default)
     if (!fs.existsSync(outputPath)) {
       fs.mkdirSync(outputPath, { recursive: true });
     }
@@ -144,46 +156,57 @@ router.post('/video', async (req, res) => {
     const timestamp = Date.now();
     const outputFile = path.join(outputPath, `video_${timestamp}.${format}`);
     
-    // Determine format selection - always use best quality
+    // Determine format selection
     let formatSelection = 'best';
     if (quality === 'audio') {
       formatSelection = 'bestaudio/best';
     } else {
-      // Always use best video quality (highest available)
       formatSelection = 'best';
     }
 
-    // Download video using yt-dlp
+    console.log('⬇️ Starting download...');
+
+    // Download video using yt-dlp with timeout
     const command = `yt-dlp -f "${formatSelection}" -o "${outputFile}" --no-playlist "${url}"`;
     
-    await execAsync(command);
+    await execAsync(command, {
+      timeout: 120000 // 120 second timeout (2 minutes)
+    });
+
+    console.log('✅ Download complete');
 
     // Check if file exists
     if (!fs.existsSync(outputFile)) {
       return res.status(500).json({ message: 'Download failed - file not found' });
     }
 
+    // Get file stats
+    const stats = fs.statSync(outputFile);
+    console.log('📦 File size:', (stats.size / 1024 / 1024).toFixed(2), 'MB');
+
     // Send file
-    res.download(outputFile, (err) => {
+    res.download(outputFile, `video.${format}`, (err) => {
       if (err) {
-        console.error('Error sending file:', err);
+        console.error('❌ Error sending file:', err);
       }
-      // Clean up file after sending (with delay to ensure download completes)
+      // Clean up file after sending
       setTimeout(() => {
         if (fs.existsSync(outputFile)) {
           try {
             fs.unlinkSync(outputFile);
+            console.log('🗑️ File cleaned up');
           } catch (cleanupError) {
-            console.error('Error cleaning up file:', cleanupError);
+            console.error('❌ Error cleaning up file:', cleanupError);
           }
         }
       }, 10000); // 10 second delay
     });
   } catch (error) {
-    console.error('Error downloading video:', error);
+    console.error('❌ Error downloading video:', error);
     res.status(500).json({ 
       message: 'Failed to download video',
-      error: error.message 
+      error: error.message,
+      details: error.code === 'ETIMEDOUT' ? 'Download took too long. Try a shorter video.' : 'An error occurred during download.'
     });
   }
 });
@@ -219,7 +242,9 @@ router.post('/batch', async (req, res) => {
     
     for (const url of urls) {
       try {
-        const { stdout } = await execAsync(`yt-dlp --dump-json --no-playlist "${url}"`);
+        const { stdout } = await execAsync(`yt-dlp --dump-json --no-playlist "${url}"`, {
+          timeout: 30000
+        });
         const videoInfo = JSON.parse(stdout);
         results.push({
           url,
